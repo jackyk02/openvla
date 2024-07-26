@@ -27,26 +27,26 @@ Note that if your server is not accessible on the open web, you can use ngrok, o
     => `ssh -L 8000:localhost:8000 ssh USER@<SERVER_IP>`
 """
 
+from transformers import AutoModelForVision2Seq, AutoProcessor
+from PIL import Image
+from fastapi.responses import JSONResponse
+from fastapi import FastAPI
+import uvicorn
+import torch
+import draccus
+from typing import Any, Dict, Optional, Union
+from pathlib import Path
+from dataclasses import dataclass
+import traceback
+import logging
+import json
 import os.path
 
 # ruff: noqa: E402
 import json_numpy
 
 json_numpy.patch()
-import json
-import logging
-import traceback
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Optional, Union
 
-import draccus
-import torch
-import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
 
 # === Utilities ===
 SYSTEM_PROMPT = (
@@ -71,13 +71,15 @@ class OpenVLAServer:
             => Returns  {"action": np.ndarray}
         """
         self.openvla_path, self.attn_implementation = openvla_path, attn_implementation
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device(
+            "cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
         # Load VLA Model using HF AutoClasses
-        self.processor = AutoProcessor.from_pretrained(self.openvla_path, trust_remote_code=True)
+        self.processor = AutoProcessor.from_pretrained(
+            self.openvla_path, trust_remote_code=True)
         self.vla = AutoModelForVision2Seq.from_pretrained(
             self.openvla_path,
-            attn_implementation=attn_implementation,
+            # attn_implementation=attn_implementation,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
@@ -101,8 +103,10 @@ class OpenVLAServer:
 
             # Run VLA Inference
             prompt = get_openvla_prompt(instruction, self.openvla_path)
-            inputs = self.processor(prompt, Image.fromarray(image).convert("RGB")).to(self.device, dtype=torch.bfloat16)
-            action = self.vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+            inputs = self.processor(prompt, Image.fromarray(image).convert(
+                "RGB")).to(self.device, dtype=torch.bfloat16)
+            action = self.vla.predict_action(
+                **inputs, unnorm_key=unnorm_key, do_sample=False)
             if double_encode:
                 return JSONResponse(json_numpy.dumps(action))
             else:
