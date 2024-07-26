@@ -72,7 +72,7 @@ class OpenVLAServer:
         """
         self.openvla_path, self.attn_implementation = openvla_path, attn_implementation
         self.device = torch.device(
-            "cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+            "cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 
         # Load VLA Model using HF AutoClasses
         self.processor = AutoProcessor.from_pretrained(
