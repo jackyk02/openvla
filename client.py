@@ -10,7 +10,7 @@ image = np.array(Image.open(requests.get(
     image_url, stream=True).raw).resize((256, 256)))
 
 action = requests.post(
-    "http://0.0.0.0:8000/act",
+    "http://0.0.0.0:8001/act",
     json={"image": image,
           "instruction": "do something", "unnorm_key": "bridge_orig"}
 ).json()

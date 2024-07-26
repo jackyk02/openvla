@@ -134,7 +134,7 @@ class DeployConfig:
 
     # Server Configuration
     host: str = "0.0.0.0"                                               # Host IP Address
-    port: int = 8000                                                    # Host Port
+    port: int = 8001                                                    # Host Port
 
     # fmt: on
 
