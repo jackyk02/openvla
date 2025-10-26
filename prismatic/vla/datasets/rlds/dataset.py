@@ -7,6 +7,7 @@ Core interface script for configuring and initializing RLDS datasets.
 import copy
 import inspect
 import json
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -30,9 +31,59 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+# Global variable to store high-scoring episode IDs
+HIGH_SCORING_EPISODES = None
+OVERALL_MEAN_SCORE = None
+
 
 # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
 tf.config.set_visible_devices([], "GPU")
+
+
+def load_episode_scores(json_path: str) -> Tuple[set, float]:
+    """
+    Load episode scores from JSON and return set of high-scoring episode IDs.
+    
+    Args:
+        json_path: Path to episode_scores_full_results.json
+        
+    Returns:
+        Tuple of (set of high-scoring episode IDs, overall_mean_score)
+    """
+    if not os.path.exists(json_path):
+        overwatch.warning(f"Episode scores file not found at {json_path}. No filtering will be applied.")
+        return None, None
+        
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    overall_mean_score = data['summary']['overall_mean_score']
+    high_scoring_episodes = set()
+    
+    for episode_id, episode_data in data['episode_scores'].items():
+        if episode_data['mean_score'] > overall_mean_score:
+            high_scoring_episodes.add(int(episode_id))
+    
+    overwatch.info(f"Loaded episode scores: {len(high_scoring_episodes)}/{len(data['episode_scores'])} episodes above mean score {overall_mean_score:.4f}")
+    
+    return high_scoring_episodes, overall_mean_score
+
+
+def initialize_episode_filter(episode_scores_path: Optional[str] = None):
+    """
+    Initialize the global episode filter with episode scores.
+    
+    Args:
+        episode_scores_path: Path to episode_scores_full_results.json. 
+                           If None, looks for it in the workspace root.
+    """
+    global HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE
+    
+    if episode_scores_path is None:
+        # Default path - look in workspace root
+        episode_scores_path = "/root/openvla/episode_scores_full_results.json"
+    
+    HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE = load_episode_scores(episode_scores_path)
 
 
 # ruff: noqa: B006
@@ -53,6 +104,8 @@ def make_dataset_from_rlds(
     action_normalization_mask: Optional[List[bool]] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
+    filter_high_scoring_episodes: bool = True,
+    episode_scores_path: Optional[str] = None,
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
@@ -112,6 +165,8 @@ def make_dataset_from_rlds(
             it's always exactly 0 or 1. By default, all action dimensions are normalized.
         num_parallel_reads (int): number of parallel read workers. Default to AUTOTUNE.
         num_parallel_calls (int): number of parallel calls for traj_map operations. Default to AUTOTUNE.
+        filter_high_scoring_episodes (bool): If True, only load episodes with mean score above overall mean.
+        episode_scores_path (str, optional): Path to episode_scores_full_results.json. If None, uses default path.
     Returns:
         Dataset of trajectories where each step has the following fields:
         - observation:
@@ -124,6 +179,11 @@ def make_dataset_from_rlds(
         - action                        # action vector
         - dataset_name                  # name of the dataset
     """
+    # Initialize episode filtering if requested
+    global HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE
+    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is None:
+        initialize_episode_filter(episode_scores_path)
+
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
@@ -239,9 +299,54 @@ def make_dataset_from_rlds(
     split="val"
     print(f"Using split: {split}")
 
-    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+    # When filtering by episode scores, load only high-scoring episodes explicitly
+    # This ensures correct alignment even when some episodes were skipped during scoring
+    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is not None:
+        overwatch.info(f"Loading {len(HIGH_SCORING_EPISODES)} high-scoring episodes explicitly...")
+        
+        # Convert to sorted list for consistent ordering
+        episode_ids_to_load = sorted(list(HIGH_SCORING_EPISODES))
+        
+        # Load each episode individually with its actual episode ID
+        episode_datasets = []
+        for ep_id in episode_ids_to_load:
+            # Load single episode with explicit ID
+            ep_dataset = dl.DLataset.from_rlds(
+                builder, 
+                split=f"{split}[{ep_id}:{ep_id+1}]",
+                shuffle=False,
+                num_parallel_reads=1
+            )
+            episode_datasets.append(ep_dataset)
+        
+        # Concatenate all episode datasets
+        if episode_datasets:
+            # Start with the first dataset
+            dataset = episode_datasets[0]
+            # Concatenate the rest
+            for ep_ds in episode_datasets[1:]:
+                dataset = dataset.concatenate(ep_ds)
+            
+            overwatch.info(f"Successfully loaded {len(episode_datasets)} high-scoring episodes")
+            
+            # Shuffle if requested (now that we have the right episodes)
+            if shuffle:
+                # Get rough size estimate for shuffle buffer
+                # Use a reasonable buffer size to mix episodes
+                shuffle_buffer = min(10000, len(episode_ids_to_load) * 100)
+                dataset = dataset.shuffle(shuffle_buffer)
+        else:
+            raise ValueError("No high-scoring episodes found to load!")
+    else:
+        # Normal loading without filtering
+        dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
+    
+    # Log filtering result
+    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is not None:
+        overwatch.info(f"Loaded dataset with {len(HIGH_SCORING_EPISODES)} high-scoring episodes (score > {OVERALL_MEAN_SCORE:.4f})")
+    
     dataset = dataset.traj_map(
         partial(
             normalize_action_and_proprio,
