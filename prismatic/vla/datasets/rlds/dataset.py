@@ -309,23 +309,35 @@ def make_dataset_from_rlds(
         
         # The episode IDs in the JSON correspond to RLDS indices
         # (e.g., episode "0" in JSON = val[0:1] in RLDS, episode "3" = val[3:4], etc.)
-        # So we enumerate the dataset and keep only episodes whose index is in HIGH_SCORING_EPISODES
+        # We'll add episode index to each trajectory, then filter
         
         # Convert to sorted list for TF constant
         high_scoring_indices = sorted(list(HIGH_SCORING_EPISODES))
         high_scoring_tensor = tf.constant(high_scoring_indices, dtype=tf.int64)
         
-        def index_filter(element):
-            # element is a tuple (idx, traj) from enumerate()
-            idx = element[0]
+        # Add episode index to each trajectory
+        def add_episode_idx(idx_traj_tuple):
+            idx, traj = idx_traj_tuple
+            traj["_episode_idx"] = idx
+            return traj
+        
+        dataset = dataset.enumerate().traj_map(add_episode_idx, num_parallel_calls)
+        
+        # Filter by episode index
+        def index_filter(traj):
+            idx = traj["_episode_idx"]
             # Check if this episode index is in our high-scoring set
             return tf.reduce_any(tf.equal(idx, high_scoring_tensor))
         
-        # Enumerate, filter, then remove the index
-        dataset = dataset.enumerate().filter(index_filter).traj_map(
-            lambda element: element[1],  # Keep only trajectory, drop index
-            num_parallel_calls
-        )
+        dataset = dataset.filter(index_filter)
+        
+        # Remove the temporary index field
+        def remove_episode_idx(traj):
+            traj = dict(traj)
+            traj.pop("_episode_idx", None)
+            return traj
+        
+        dataset = dataset.traj_map(remove_episode_idx, num_parallel_calls)
         
         overwatch.info(f"Dataset filtered to {len(HIGH_SCORING_EPISODES)} high-scoring episodes")
         
