@@ -7,7 +7,6 @@ Core interface script for configuring and initializing RLDS datasets.
 import copy
 import inspect
 import json
-import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -31,59 +30,9 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
-# Global variable to store high-scoring episode IDs
-HIGH_SCORING_EPISODES = None
-OVERALL_MEAN_SCORE = None
-
 
 # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
 tf.config.set_visible_devices([], "GPU")
-
-
-def load_episode_scores(json_path: str) -> Tuple[set, float]:
-    """
-    Load episode scores from JSON and return set of high-scoring episode IDs.
-    
-    Args:
-        json_path: Path to episode_scores_full_results.json
-        
-    Returns:
-        Tuple of (set of high-scoring episode IDs, overall_mean_score)
-    """
-    if not os.path.exists(json_path):
-        overwatch.warning(f"Episode scores file not found at {json_path}. No filtering will be applied.")
-        return None, None
-        
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    
-    overall_mean_score = data['summary']['overall_mean_score']
-    high_scoring_episodes = set()
-    
-    for episode_id, episode_data in data['episode_scores'].items():
-        if episode_data['mean_score'] > overall_mean_score:
-            high_scoring_episodes.add(int(episode_id))
-    
-    overwatch.info(f"Loaded episode scores: {len(high_scoring_episodes)}/{len(data['episode_scores'])} episodes above mean score {overall_mean_score:.4f}")
-    
-    return high_scoring_episodes, overall_mean_score
-
-
-def initialize_episode_filter(episode_scores_path: Optional[str] = None):
-    """
-    Initialize the global episode filter with episode scores.
-    
-    Args:
-        episode_scores_path: Path to episode_scores_full_results.json. 
-                           If None, looks for it in the workspace root.
-    """
-    global HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE
-    
-    if episode_scores_path is None:
-        # Default path - look in workspace root
-        episode_scores_path = "/root/openvla/episode_scores_full_results.json"
-    
-    HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE = load_episode_scores(episode_scores_path)
 
 
 # ruff: noqa: B006
@@ -104,8 +53,9 @@ def make_dataset_from_rlds(
     action_normalization_mask: Optional[List[bool]] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
-    filter_high_scoring_episodes: bool = True,
-    episode_scores_path: Optional[str] = None,
+    # Fast episode filtering (keeps only episodes with mean score > overall mean)
+    filter_high_scoring_episodes: bool = False,
+    episode_scores_path: Optional[str] = "/root/openvla/episode_scores_full_results.json",
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
@@ -165,8 +115,6 @@ def make_dataset_from_rlds(
             it's always exactly 0 or 1. By default, all action dimensions are normalized.
         num_parallel_reads (int): number of parallel read workers. Default to AUTOTUNE.
         num_parallel_calls (int): number of parallel calls for traj_map operations. Default to AUTOTUNE.
-        filter_high_scoring_episodes (bool): If True, only load episodes with mean score above overall mean.
-        episode_scores_path (str, optional): Path to episode_scores_full_results.json. If None, uses default path.
     Returns:
         Dataset of trajectories where each step has the following fields:
         - observation:
@@ -179,11 +127,6 @@ def make_dataset_from_rlds(
         - action                        # action vector
         - dataset_name                  # name of the dataset
     """
-    # Initialize episode filtering if requested
-    global HIGH_SCORING_EPISODES, OVERALL_MEAN_SCORE
-    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is None:
-        initialize_episode_filter(episode_scores_path)
-
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
@@ -261,6 +204,35 @@ def make_dataset_from_rlds(
 
     builder = tfds.builder(name, data_dir=data_dir)
 
+    # Optional: load high-scoring episode ids and build a boolean mask for fast filtering
+    high_score_mask = None
+    max_episode_id = None
+    if filter_high_scoring_episodes and episode_scores_path:
+        try:
+            with tf.io.gfile.GFile(episode_scores_path, "r") as f:
+                scores_json = json.load(f)
+            overall_mean = float(scores_json["summary"]["overall_mean_score"])  # type: ignore[index]
+            # Collect episode ids whose mean_score > overall_mean
+            keep_ids = [
+                int(ep_id)
+                for ep_id, data in scores_json["episode_scores"].items()  # type: ignore[index]
+                if float(data.get("mean_score", -1)) > overall_mean
+            ]
+            if len(keep_ids) > 0:
+                max_episode_id = max(keep_ids)
+                mask_np = np.zeros(max_episode_id + 1, dtype=np.bool_)
+                mask_np[np.array(keep_ids, dtype=np.int64)] = True
+                high_score_mask = tf.constant(mask_np, dtype=tf.bool)
+                overwatch.info(
+                    "Episode filtering enabled: keeping %d episodes above overall mean %.4f",
+                    len(keep_ids),
+                    overall_mean,
+                )
+            else:
+                overwatch.warning("Episode filtering requested but no high-scoring episodes found; skipping filter.")
+        except Exception as e:
+            overwatch.warning("Failed to load episode scores from %s: %s. Skipping filtering.", episode_scores_path, e)
+
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):
         with tf.io.gfile.GFile(dataset_statistics, "r") as f:
@@ -295,66 +267,30 @@ def make_dataset_from_rlds(
         split = "train[:95%]" if train else "train[95%:]"
     else:
         split = "train" if train else "val"
-    
-    split="val"
-    print(f"Using split: {split}")
 
-    # Load dataset - when filtering, we'll load all and filter by index
-    # Note: Episode IDs in JSON correspond to RLDS indices (val[0:1] = episode 0, etc.)
-    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=False, num_parallel_reads=num_parallel_reads)
-    
-    # Apply filtering by episode index if requested
-    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is not None:
-        overwatch.info(f"Filtering to keep {len(HIGH_SCORING_EPISODES)} high-scoring episodes...")
-        
-        # The episode IDs in the JSON correspond to RLDS indices
-        # (e.g., episode "0" in JSON = val[0:1] in RLDS, episode "3" = val[3:4], etc.)
-        # We'll add episode index to each trajectory, then filter
-        
-        # Convert to sorted list for TF constant
-        high_scoring_indices = sorted(list(HIGH_SCORING_EPISODES))
-        high_scoring_tensor = tf.constant(high_scoring_indices, dtype=tf.int64)
-        
-        # Add episode index to each trajectory
-        def add_episode_idx(idx_traj_tuple):
-            idx, traj = idx_traj_tuple
-            traj["_episode_idx"] = idx
-            return traj
-        
-        dataset = dataset.enumerate().traj_map(add_episode_idx, num_parallel_calls)
-        
-        # Filter by episode index
-        def index_filter(traj):
-            idx = traj["_episode_idx"]
-            # Check if this episode index is in our high-scoring set
-            return tf.reduce_any(tf.equal(idx, high_scoring_tensor))
-        
-        dataset = dataset.filter(index_filter)
-        
-        # Remove the temporary index field
-        def remove_episode_idx(traj):
-            traj = dict(traj)
-            traj.pop("_episode_idx", None)
-            return traj
-        
-        dataset = dataset.traj_map(remove_episode_idx, num_parallel_calls)
-        
-        overwatch.info(f"Dataset filtered to {len(HIGH_SCORING_EPISODES)} high-scoring episodes")
-        
-        # Apply shuffle if requested (after filtering)
-        if shuffle:
-            shuffle_buffer = min(10000, len(high_scoring_indices) * 100)
-            dataset = dataset.shuffle(shuffle_buffer)
-    elif shuffle:
-        # Shuffle if requested and no filtering
-        dataset = dataset.shuffle(10000)
+    overwatch.info("Using split: %s", split)
+
+    # Load the entire split once, then filter by episode index for speed
+    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+
+    # If high-score mask is available, use RLDS internal _traj_index to filter quickly
+    if high_score_mask is not None:
+        def keep_traj(traj: dict) -> tf.Tensor:
+            # RLDS exposes original episode index via hidden key '_traj_index'
+            # Fallback to keeping if key is missing
+            ep_idx = traj.get("_traj_index", None)
+            if ep_idx is None:
+                return tf.constant(True)
+            # Clamp indices beyond mask length to False
+            idx = tf.cast(ep_idx, tf.int32)
+            in_bounds = tf.less(idx, tf.shape(high_score_mask)[0])
+            return tf.logical_and(in_bounds, tf.gather(high_score_mask, idx))
+
+        # Filter at trajectory granularity before heavy maps
+        dataset = dataset.filter(keep_traj)
+        overwatch.info("Applied in-pipeline episode filtering using _traj_index mask")
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
-    
-    # Log filtering result
-    if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is not None:
-        overwatch.info(f"Loaded dataset with {len(HIGH_SCORING_EPISODES)} high-scoring episodes (score > {OVERALL_MEAN_SCORE:.4f})")
-    
     dataset = dataset.traj_map(
         partial(
             normalize_action_and_proprio,
