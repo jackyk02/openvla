@@ -299,47 +299,42 @@ def make_dataset_from_rlds(
     split="val"
     print(f"Using split: {split}")
 
-    # When filtering by episode scores, load only high-scoring episodes explicitly
-    # This ensures correct alignment even when some episodes were skipped during scoring
+    # Load dataset - when filtering, we'll load all and filter by index
+    # Note: Episode IDs in JSON correspond to RLDS indices (val[0:1] = episode 0, etc.)
+    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=False, num_parallel_reads=num_parallel_reads)
+    
+    # Apply filtering by episode index if requested
     if filter_high_scoring_episodes and HIGH_SCORING_EPISODES is not None:
-        overwatch.info(f"Loading {len(HIGH_SCORING_EPISODES)} high-scoring episodes explicitly...")
+        overwatch.info(f"Filtering to keep {len(HIGH_SCORING_EPISODES)} high-scoring episodes...")
         
-        # Convert to sorted list for consistent ordering
-        episode_ids_to_load = sorted(list(HIGH_SCORING_EPISODES))
+        # The episode IDs in the JSON correspond to RLDS indices
+        # (e.g., episode "0" in JSON = val[0:1] in RLDS, episode "3" = val[3:4], etc.)
+        # So we enumerate the dataset and keep only episodes whose index is in HIGH_SCORING_EPISODES
         
-        # Load each episode individually with its actual episode ID
-        episode_datasets = []
-        for ep_id in episode_ids_to_load:
-            # Load single episode with explicit ID
-            ep_dataset = dl.DLataset.from_rlds(
-                builder, 
-                split=f"{split}[{ep_id}:{ep_id+1}]",
-                shuffle=False,
-                num_parallel_reads=1
-            )
-            episode_datasets.append(ep_dataset)
+        # Convert to sorted list for TF constant
+        high_scoring_indices = sorted(list(HIGH_SCORING_EPISODES))
+        high_scoring_tensor = tf.constant(high_scoring_indices, dtype=tf.int64)
         
-        # Concatenate all episode datasets
-        if episode_datasets:
-            # Start with the first dataset
-            dataset = episode_datasets[0]
-            # Concatenate the rest
-            for ep_ds in episode_datasets[1:]:
-                dataset = dataset.concatenate(ep_ds)
-            
-            overwatch.info(f"Successfully loaded {len(episode_datasets)} high-scoring episodes")
-            
-            # Shuffle if requested (now that we have the right episodes)
-            if shuffle:
-                # Get rough size estimate for shuffle buffer
-                # Use a reasonable buffer size to mix episodes
-                shuffle_buffer = min(10000, len(episode_ids_to_load) * 100)
-                dataset = dataset.shuffle(shuffle_buffer)
-        else:
-            raise ValueError("No high-scoring episodes found to load!")
-    else:
-        # Normal loading without filtering
-        dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+        def index_filter(idx_and_traj):
+            idx, traj = idx_and_traj
+            # Check if this episode index is in our high-scoring set
+            return tf.reduce_any(tf.equal(idx, high_scoring_tensor))
+        
+        # Enumerate, filter, then remove the index
+        dataset = dataset.enumerate().filter(index_filter).traj_map(
+            lambda idx_and_traj: idx_and_traj[1],  # Keep only trajectory, drop index
+            num_parallel_calls
+        )
+        
+        overwatch.info(f"Dataset filtered to {len(HIGH_SCORING_EPISODES)} high-scoring episodes")
+        
+        # Apply shuffle if requested (after filtering)
+        if shuffle:
+            shuffle_buffer = min(10000, len(high_scoring_indices) * 100)
+            dataset = dataset.shuffle(shuffle_buffer)
+    elif shuffle:
+        # Shuffle if requested and no filtering
+        dataset = dataset.shuffle(10000)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
     
