@@ -315,14 +315,15 @@ def make_dataset_from_rlds(
         high_scoring_indices = sorted(list(HIGH_SCORING_EPISODES))
         high_scoring_tensor = tf.constant(high_scoring_indices, dtype=tf.int64)
         
-        def index_filter(idx_and_traj):
-            idx, traj = idx_and_traj
+        def index_filter(element):
+            # element is a tuple (idx, traj) from enumerate()
+            idx = element[0]
             # Check if this episode index is in our high-scoring set
             return tf.reduce_any(tf.equal(idx, high_scoring_tensor))
         
         # Enumerate, filter, then remove the index
         dataset = dataset.enumerate().filter(index_filter).traj_map(
-            lambda idx_and_traj: idx_and_traj[1],  # Keep only trajectory, drop index
+            lambda element: element[1],  # Keep only trajectory, drop index
             num_parallel_calls
         )
         
