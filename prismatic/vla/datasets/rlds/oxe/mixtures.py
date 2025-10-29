@@ -193,6 +193,11 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         ("droid_wipe", 1.0),
     ],
 
+    # === Full DROID Dataset ===
+    "droid": [
+        ("droid", 1.0),
+    ],
+
     # === LIBERO Datasets (Modified Versions) ===
     "libero_spatial_no_noops": [
         ("libero_spatial_no_noops", 1.0),

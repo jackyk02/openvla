@@ -198,6 +198,16 @@ class Exp_SigLIP_224px_Droid_Wipe(Exp_SigLIP_224px_Bridge):
     data_mix: str = "droid_wipe"
 
 
+# === [8 GPU] Training on Full DROID Dataset ===
+@dataclass
+class Exp_DinoSigLIP_224px_Droid(Exp_SigLIP_224px_Bridge):
+    vla_id: str = "prism-dinosiglip-224px+mx-droid"
+    base_vlm: Union[str, Path] = "prism-dinosiglip-224px+7b"
+
+    data_mix: str = "droid"
+    shuffle_buffer_size: int = 500_000  # DROID is large (~1.7TB), adjust based on memory
+
+
 # === Define a VLA Registry Enum for Reference & Validation ===
 @unique
 class VLARegistry(Enum):
@@ -224,6 +234,9 @@ class VLARegistry(Enum):
 
     # === DROID Fine-tuning Configs ===
     SIGLIP_224PX_MX_DROID_WIPE = Exp_SigLIP_224px_Droid_Wipe
+
+    # === DROID Full Dataset Training ===
+    DINOSIGLIP_224PX_MX_DROID = Exp_DinoSigLIP_224px_Droid
 
     @property
     def vla_id(self) -> str:
